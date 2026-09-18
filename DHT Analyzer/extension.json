@@ -1,0 +1,13 @@
+{
+  "name": "DHT Analyzer",
+  "apiVersion": "1.0.0",
+  "author": "levywave",
+  "version": "1.1.0",
+  "description": "Decodes the DHT11 / DHT12 / DHT22(AM2302) single-wire temperature & humidity protocol and shows 'RH 33% / T 28 C' bubbles. Needs the built-in Simple Parallel analyzer as an edge sampler (Clock = the DHT data line, Clock Edge = Falling, D0 = the same line). Documentation in English and Chinese (中文).",
+  "extensions": {
+    "DHT Analyzer": {
+      "type": "HighLevelAnalyzer",
+      "entryPoint": "DHTAnalyzer.DhtHla"
+    }
+  }
+}
