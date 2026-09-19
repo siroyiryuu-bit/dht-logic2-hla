@@ -2,8 +2,8 @@
   "name": "DHT Analyzer",
   "apiVersion": "1.0.0",
   "author": "siroyiryuu",
-  "version": "1.1.3",
-  "description": "Decodes the DHT11 / DHT12 / DHT22(AM2302) single-wire temperature & humidity protocol and shows 'RH 33% / T 28 C' bubbles. Needs the built-in Simple Parallel analyzer as an edge sampler (Clock = the DHT data line, Clock Edge = Falling, D0 = the same line). Documentation in English and Chinese (中文).",
+  "version": "1.1.4",
+  "description": "在 Logic 2 里解码 DHT11 / DHT12 / DHT22(AM2302) 单总线温湿度：借内置 Simple Parallel 边沿采样，波形上直接标出 RH/T 与校验结论。",
   "extensions": {
     "DHT Analyzer": {
       "type": "HighLevelAnalyzer",
