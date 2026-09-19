@@ -101,6 +101,7 @@ class DhtHla(HighLevelAnalyzer):
         self.state = 'idle'        # idle -> response -> bits
         self.bits = []             # [(值, 高电平us, 起始时刻, 结束时刻), ...]
         self.bits_start_time = None
+        self.emitted = False       # 本帧是否已出过读数气泡（提前出结果用）
 
         print('[DHT HLA] 型号=%s；阈值 start_min=%.0fus bit_low=%.0fus bit1>%.0fus%s'
               % (self.sensor_type, self.eff_start_min, self.eff_bit_low,
@@ -140,6 +141,7 @@ class DhtHla(HighLevelAnalyzer):
         self.state = 'idle'
         self.bits = []
         self.bits_start_time = None
+        self.emitted = False
 
     # ---------------- 主解码 ----------------
     def decode(self, frame: AnalyzerFrame):
@@ -165,7 +167,9 @@ class DhtHla(HighLevelAnalyzer):
         if dt >= self.eff_start_min:
             out = []
             if self.state == 'bits' and self.bits:
-                if len(self.bits) >= 32:
+                if self.emitted:
+                    pass                       # 本帧读数已出过，尾部位忽略
+                elif len(self.bits) >= 32:
                     # 上一帧读数已完整（只是校验位没采全）→ 照常出读数
                     out.extend(self._finish(t0, len(self.bits) >= 39))
                 else:
@@ -200,29 +204,33 @@ class DhtHla(HighLevelAnalyzer):
                     'high_us': '%.0f' % high,
                 })]
 
-            # 39 个位间隔全部收到 → 出结果（含校验比对）
-            if len(self.bits) >= 39:
-                result = self._finish(t, True)
-                self._reset()
-                return result
+            out = []
             # ★ 收满 32 位就先出读数（bit32..39 是校验和，湿度/温度 4 字节已完整）。
             #   实测教训：捕获窗口经常正好在最后一个下降沿（≈起始后 24.1ms）之前结束，
             #   若死等 39 位就永远出不了结果（用户实测：终端只有初始化、没有 raw=）。
-            #   位 32 之后的后续沿会因 state 已复位而被忽略，无副作用。
-            if len(self.bits) >= 32:
-                result = self._finish(t, False)
+            if not self.emitted and len(self.bits) >= 32:
+                out.extend(self._finish(t, False))
+                self.emitted = True
+            # ★★ 2026-09-19 修：这里**不能**写成 elif —— 原来的写法让"39 位就出结果
+            #   （含校验比对）"永远轮不到（32 位那一步已经把 state 复位了），
+            #   后果是**校验位从来没被比对过**，每次输出都是"只含 32 位"。
+            #   现在提前出读数后继续收剩下的校验位：收满 39 位时把校验结论打出来
+            #   （终端总是打印；校验明确失败再补一个 ERR 气泡）。
+            if len(self.bits) >= 39:
+                if self.emitted:
+                    out.extend(self._checksum_only(self.bits_start_time, t))
+                else:
+                    out.extend(self._finish(t, True))
                 self._reset()
-                return result
+            if out:
+                return out
 
         return None
 
     # ---------------- 组帧 / 校验 / 读数 ----------------
-    def _finish(self, end_time, full):
-        """full=True：40 位里的 39 个间隔都收到了（可校验）；False：只有前 32 位（读数有效）。"""
+    def _bytes_and_checksum(self):
+        """返回 (b0, b1, b2, b3, 期望校验和, 收到的校验字节高 7 位)。"""
         bits = [b[0] for b in self.bits]
-        span_start = self.bits_start_time
-        n_bits = len(bits)
-
         data = []
         for i in range(0, 39, 8):
             byte = 0
@@ -231,19 +239,11 @@ class DhtHla(HighLevelAnalyzer):
             data.append(byte)                        # 前 4 字节完整，第 5 字节只有高 7 位
         while len(data) < 5:
             data.append(0)
-
         b0, b1, b2, b3 = data[0], data[1], data[2], data[3]
-        expected = (b0 + b1 + b2 + b3) & 0xFF
+        return b0, b1, b2, b3, (b0 + b1 + b2 + b3) & 0xFF, data[4]
 
-        if full:
-            # data[4] 只有 7 个位（bit32..38），它的值 = 校验字节的"高 7 位" = 校验和 >> 1
-            recv_top7 = data[4]
-            chk_ok = (recv_top7 == (expected >> 1))  # 最低位因无后续下降沿而不可测
-        else:
-            recv_top7 = None
-            chk_ok = None                            # 校验位没采全 → 不比
-
-        # ---- 按型号换算字节 ----
+    def _read_values(self, b0, b1, b2, b3):
+        """按型号换算湿度/温度。"""
         if self.sensor_type == 'DHT22 / AM2302':
             humidity = float(((b0 << 8) | b1)) * 0.1
             raw_t = float(((b2 & 0x7F) << 8) | b3) * 0.1
@@ -251,18 +251,39 @@ class DhtHla(HighLevelAnalyzer):
         else:                                        # DHT11 / DHT12
             humidity = float(b0) + float(b1) * 0.1
             temperature = float(b2) + float(b3) * 0.1
+        return humidity, temperature
 
-        if full:
-            info = 'raw=%02X %02X %02X %02X (chk~%02X / exp %02X, 末位不可测) %s' % (
-                b0, b1, b2, b3, (recv_top7 << 1), expected,
-                'OK' if chk_ok else 'BAD')
+    def _checksum_info(self):
+        """(校验是否通过, 人类可读的一行)。"""
+        b0, b1, b2, b3, expected, recv_top7 = self._bytes_and_checksum()
+        # recv_top7 = 收到的校验字节"高 7 位" = 校验和 >> 1；
+        # 最低位（bit39）因其后没有下降沿而不可测。
+        ok = (recv_top7 == (expected >> 1))
+        info = 'raw=%02X %02X %02X %02X (chk~%02X / exp %02X, 末位不可测) %s' % (
+            b0, b1, b2, b3, recv_top7 << 1, expected, 'OK' if ok else 'BAD')
+        return ok, info
+
+    def _finish(self, end_time, checksum_known):
+        """组帧出结果。
+
+        checksum_known=True  → 39 个位间隔都收到了：比对并报告校验；
+        checksum_known=False → 提前出读数（32 位）：读数有效，校验结论由
+                               _checksum_only() 在收满 39 位时补打。
+        """
+        b0, b1, b2, b3, _expected, _recv = self._bytes_and_checksum()
+        humidity, temperature = self._read_values(b0, b1, b2, b3)
+        span_start = self.bits_start_time
+
+        if checksum_known:
+            ok, info = self._checksum_info()
         else:
-            info = 'raw=%02X %02X %02X %02X（捕获只含 %d 位 → 湿度/温度有效，校验未比对）' % (
-                b0, b1, b2, b3, n_bits)
+            ok = None
+            info = 'raw=%02X %02X %02X %02X（%d 位 → 湿度/温度有效，校验位待收）' % (
+                b0, b1, b2, b3, len(self.bits))
         print('[DHT HLA] %s' % info)
 
         # 校验明确失败才报错；没采全校验位的场合读数仍然有效
-        if full and not chk_ok:
+        if ok is False:
             return [AnalyzerFrame('dht_error', span_start, end_time, {
                 'info': '校验失败 %s' % info,
             })]
@@ -270,3 +291,13 @@ class DhtHla(HighLevelAnalyzer):
             'humidity': ('%.1f' % humidity),
             'temperature': ('%.1f' % temperature),
         })]
+
+    def _checksum_only(self, span_start, end_time):
+        """读数已经出过了，这里只补报校验结论（终端打印；失败再补 ERR 气泡）。"""
+        ok, info = self._checksum_info()
+        print('[DHT HLA] %s' % info)
+        if not ok:
+            return [AnalyzerFrame('dht_error', span_start, end_time, {
+                'info': '校验失败 %s' % info,
+            })]
+        return []
